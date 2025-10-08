@@ -9,6 +9,10 @@ import digitalio
 from adafruit_display_text import label
 import terminalio
 import busio
+import wifi
+import socketpool
+import adafruit_ntp
+import rtc
 
 # Release any existing displays
 displayio.release_displays()
@@ -62,12 +66,83 @@ class PhysicalButton:
 try:
     next_button = PhysicalButton(board.IO12)
     prev_button = PhysicalButton(board.IO11)
+    mode_button = PhysicalButton(board.IO2)  # New mode button
 except Exception as e:
     print(f"Button init error: {e}")
 
 # Button press cooldown to prevent spam (in seconds)
 BUTTON_COOLDOWN = 0.5
 last_button_press = 0
+
+# Mode state
+current_mode = "gif"  # Start in GIF mode
+
+# WiFi and time setup
+try:
+    # Get WiFi details from settings.toml
+    ssid = os.getenv("CIRCUITPY_WIFI_SSID")
+    password = os.getenv("CIRCUITPY_WIFI_PASSWORD")
+    tz_offset_str = os.getenv("CIRCUITPY_TZ_OFFSET", "0")  # Default to 0 if not set
+    
+    # Convert timezone offset to integer
+    tz_offset = int(tz_offset_str)
+    
+    if ssid and password:
+        wifi.radio.connect(ssid, password)
+        pool = socketpool.SocketPool(wifi.radio)
+        ntp = adafruit_ntp.NTP(pool, tz_offset=tz_offset)
+        rtc.RTC().datetime = ntp.datetime
+        print(f"Time synchronized via NTP (Timezone offset: {tz_offset} hours)")
+    else:
+        print("WiFi credentials not found in settings.toml")
+except Exception as e:
+    print(f"Failed to sync time: {e}")
+
+# Create clock display elements once (not every second)
+time_label = label.Label(terminalio.FONT, text="00:00:00", color=0xFFFFFF)
+time_label.x = 10
+time_label.y = HEIGHT // 2 - 10
+
+date_label = label.Label(terminalio.FONT, text="YYYY-MM-DD", color=0xFFFFFF)
+date_label.x = 10
+date_label.y = HEIGHT // 2 + 10
+
+clock_group = displayio.Group()
+clock_group.append(time_label)
+clock_group.append(date_label)
+
+def update_clock_display():
+    """Update the clock display with current time (no flicker)"""
+    try:
+        now = time.localtime()
+        
+        # Format time as HH:MM:SS
+        hour_12 = now.tm_hour % 12
+        if hour_12 == 0:
+            hour_12 = 12
+        period = "AM" if now.tm_hour < 12 else "PM"
+        time_str = "{:02d}:{:02d}:{:02d} {}".format(hour_12, now.tm_min, now.tm_sec, period)
+        time_label.text = time_str
+        
+        # Format date as YYYY-MM-DD
+        date_str = "{:04d}-{:02d}-{:02d}".format(now.tm_year, now.tm_mon, now.tm_mday)
+        date_label.text = date_str
+        
+    except Exception as e:
+        print(f"Error updating clock: {e}")
+
+def switch_mode():
+    """Switch between GIF and clock modes"""
+    global current_mode
+    if current_mode == "gif":
+        current_mode = "clock"
+        display.root_group = clock_group
+        update_clock_display()  # Update immediately when switching to clock
+        print("Switched to Clock mode")
+    else:
+        current_mode = "gif"
+        display.root_group = main_group
+        print("Switched to GIF mode")
 
 # Function to play A0.gif for the same duration as the original wait
 def show_interstitial():
@@ -140,11 +215,15 @@ def button_pressed():
     try:
         next_pressed = next_button.pressed()
         prev_pressed = prev_button.pressed()
+        mode_pressed = mode_button.pressed()
 
         # Debug output (comment out in production)
-        # print(f"Buttons - Next: {next_pressed}, Prev: {prev_pressed}")
+        # print(f"Buttons - Next: {next_pressed}, Prev: {prev_pressed}, Mode: {mode_pressed}")
 
-        if next_pressed and not prev_pressed:
+        if mode_pressed:
+            last_button_press = current_time
+            return True, "mode"
+        elif next_pressed and not prev_pressed:
             last_button_press = current_time
             return True, "next"
         elif prev_pressed and not next_pressed:
@@ -180,8 +259,8 @@ def play_gif(gif_path):
             pixel_shader=displayio.ColorConverter(
                 input_colorspace=displayio.Colorspace.L8
             ),
-            x=0,
-            y=0
+            x=(128 - odg.bitmap.width) // 2 if odg.bitmap.width < 128 else 0,
+            y=(64 - odg.bitmap.height) // 2 if odg.bitmap.height < 64 else 0
         )
 
         while len(main_group) > 0:
@@ -194,7 +273,7 @@ def play_gif(gif_path):
         while True:
             pressed, direction = button_pressed()
             if pressed:
-                print(f"Button pressed - {direction} GIF")
+                print(f"Button pressed - {direction}")
                 return direction
 
             elapsed = time.monotonic() - start_time
@@ -240,22 +319,34 @@ else:
 
     while True:
         try:
-            print(f"Playing GIF {current_gif_index + 1}/{len(gif_files)}")
+            if current_mode == "gif":
+                print(f"Playing GIF {current_gif_index + 1}/{len(gif_files)}")
 
-            result = play_gif(gif_files[current_gif_index])
+                result = play_gif(gif_files[current_gif_index])
 
-            if result == "next":
-                show_interstitial()  # Changed from show_please_wait()
-                current_gif_index = (current_gif_index + 1) % len(gif_files)
-                print(f"Switching to next GIF: {current_gif_index + 1}/{len(gif_files)}")
-            elif result == "previous":
-                show_interstitial()  # Changed from show_please_wait()
-                current_gif_index = (current_gif_index - 1) % len(gif_files)
-                print(f"Switching to previous GIF: {current_gif_index + 1}/{len(gif_files)}")
+                if result == "next":
+                    show_interstitial()
+                    current_gif_index = (current_gif_index + 1) % len(gif_files)
+                    print(f"Switching to next GIF: {current_gif_index + 1}/{len(gif_files)}")
+                elif result == "previous":
+                    show_interstitial()
+                    current_gif_index = (current_gif_index - 1) % len(gif_files)
+                    print(f"Switching to previous GIF: {current_gif_index + 1}/{len(gif_files)}")
+                elif result == "mode":
+                    switch_mode()
+                else:
+                    show_interstitial()
+                    current_gif_index = (current_gif_index + 1) % len(gif_files)
+                    print(f"Error with current GIF, trying next: {current_gif_index + 1}/{len(gif_files)}")
             else:
-                show_interstitial()  # Changed from show_please_wait()
-                current_gif_index = (current_gif_index + 1) % len(gif_files)
-                print(f"Error with current GIF, trying next: {current_gif_index + 1}/{len(gif_files)}")
+                # Clock mode - update time every second without flickering
+                update_clock_display()
+                time.sleep(1)
+                
+                # Check for mode button press in clock mode
+                pressed, direction = button_pressed()
+                if pressed and direction == "mode":
+                    switch_mode()
 
         except Exception as e:
             print(f"Fatal error in main loop: {e}")
