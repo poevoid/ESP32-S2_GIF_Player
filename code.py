@@ -27,8 +27,9 @@ uvled.direction = digitalio.Direction.OUTPUT
 fled.value = False
 uvled.value = False
 
-# Set up PWM on IO18 for audio
+# Initialize PWM once and keep it alive
 pwm = pwmio.PWMOut(board.IO18, frequency=40000, duty_cycle=0)
+DELAY_COUNT = 65  # Optimal delay for Lolin S2 Mini
 
 # Configure SPI with explicit pins for ESP32-S2 Mini
 spi = busio.SPI(clock=board.IO36, MOSI=board.IO35)
@@ -104,7 +105,6 @@ FLASH_INTERVAL = 0.5  # seconds between flash changes
 # WAV Player State
 wav_files = [f for f in os.listdir('/') if f.lower().endswith('.wav')]
 current_wav_index = 0
-DELAY_COUNT = 65  # Optimal delay for Lolin S2 Mini
 
 if not wav_files:
     print("No WAV files found! Please add .wav files to root directory.")
@@ -138,7 +138,7 @@ def turn_off_all_leds():
     uvled.value = False
 
 def stop_audio():
-    """Stop audio playback and ensure PWM is pulled low"""
+    """Stop audio playback by setting duty cycle to 0"""
     pwm.duty_cycle = 0
 
 def play_wav_simple(filename):
@@ -164,13 +164,123 @@ def play_wav_simple(filename):
                     for _ in range(DELAY_COUNT):
                         pass
         
-        pwm.duty_cycle = 0
         print("Playback complete")
         
     except Exception as e:
         print(f"Error: {e}")
-        pwm.duty_cycle = 0
+    finally:
+        stop_audio()
 
+def play_wav_with_gif(wav_filename, gif_path):
+    """Play WAV file while simultaneously displaying GIF - optimized for both"""
+    odg = None
+    current_gif = None
+    
+    try:
+        print(f"Playing: {wav_filename} with GIF: {gif_path}")
+        
+        # Load and display the GIF first
+        try:
+            odg = gifio.OnDiskGif(gif_path)
+            current_gif = displayio.TileGrid(
+                odg.bitmap,
+                pixel_shader=displayio.ColorConverter(
+                    input_colorspace=displayio.Colorspace.L8
+                ),
+                x=(128 - odg.bitmap.width) // 2 if odg.bitmap.width < 128 else 0,
+                y=(64 - odg.bitmap.height) // 2 if odg.bitmap.height < 64 else 0
+            )
+            
+            # Clear and set up display for GIF
+            while len(main_group) > 0:
+                main_group.pop()
+            main_group.append(current_gif)
+            
+            next_frame_time = time.monotonic()
+            frame_delay = odg.next_frame()  # Get first frame delay
+            
+        except Exception as e:
+            print(f"GIF error: {e}")
+            # Show error on display
+            while len(main_group) > 0:
+                main_group.pop()
+            error_text = label.Label(terminalio.FONT, text="GIF Error", color=0xFFFFFF)
+            error_text.x = 10
+            error_text.y = HEIGHT // 2
+            main_group.append(error_text)
+            odg = None
+        
+        # Now play WAV with the exact original timing while updating GIF
+        with open(wav_filename, "rb") as f:
+            # Skip WAV header (standard 44 bytes)
+            f.seek(44)
+            
+            # Use original 512-byte chunks for perfect audio timing
+            chunk_size = 512
+            
+            # Counter for occasional GIF updates
+            samples_processed = 0
+            
+            # Play all samples
+            while True:
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
+                
+                # Process audio samples with perfect timing
+                for sample in chunk:
+                    # Convert 8-bit sample to 16-bit PWM duty cycle
+                    pwm.duty_cycle = sample * 257
+                    
+                    # EXACT original delay for perfect audio
+                    for _ in range(DELAY_COUNT):
+                        pass
+                
+                # Update GIF frame every few chunks to balance performance
+                samples_processed += 1
+                if samples_processed % 1 == 0:  # Update every 2 chunks
+                    if odg and time.monotonic() >= next_frame_time:
+                        try:
+                            frame_delay = odg.next_frame()
+                            next_frame_time = time.monotonic() + frame_delay
+                        except Exception as e:
+                            print(f"GIF frame error: {e}")
+                            odg = None
+                
+                # Check for button presses occasionally
+                if samples_processed % 4 == 0:
+                    pressed, direction = button_pressed()
+                    if pressed:
+                        return direction
+        
+        print("Playback complete")
+        return "complete"
+        
+    except Exception as e:
+        print(f"Error in WAV+GIF: {e}")
+        return "error"
+    finally:
+        # Clean up GIF resources
+        if odg:
+            try:
+                odg.deinit()
+            except:
+                pass
+        
+        # Clear the display
+        try:
+            while len(main_group) > 0:
+                main_group.pop()
+        except:
+            pass
+        
+        # Stop audio
+        stop_audio()
+        
+        # Force garbage collection to prevent memory fragmentation
+        gc.collect()
+
+# [Rest of the code remains exactly the same as the previous working version]
 # Create clock display elements once (not every second)
 time_label = label.Label(terminalio.FONT, text="00:00:00", color=0xFFFFFF)
 time_label.x = 10
@@ -242,7 +352,7 @@ def update_led_display():
         flash_state = 0
     elif led_control_state == 1:  # UVLED on, FLED off
         fled_label.text = "FLED: OFF" 
-        uvled.label.text = "UVLED: ON"
+        uvled_label.text = "UVLED: ON"
         fled.value = False
         uvled.value = True
         flash_state = 0
@@ -303,7 +413,7 @@ def update_clock_display():
         print(f"Error updating clock: {e}")
 
 def switch_mode():
-    """Switch between GIF, clock, LED control, and WAV modes"""
+    """Switch between GIF, clock, LED control, WAV, and WAV+GIF modes"""
     global current_mode
     if current_mode == "gif":
         current_mode = "clock"
@@ -325,6 +435,13 @@ def switch_mode():
         stop_audio()  # Ensure audio is stopped when entering WAV mode
         update_wav_display()  # Update immediately when switching to WAV mode
         print("Switched to WAV mode")
+    elif current_mode == "wav":
+        current_mode = "wav_gif"
+        # For WAV+GIF mode, we use the main_group to display the actual GIF
+        display.root_group = main_group
+        turn_off_all_leds()  # Turn off LEDs when leaving LED mode
+        stop_audio()  # Ensure audio is stopped when entering WAV+GIF mode
+        print("Switched to WAV+GIF mode")
     else:
         current_mode = "gif"
         display.root_group = main_group
@@ -355,6 +472,33 @@ def switch_wav_file(direction):
     
     update_wav_display()
     print(f"WAV File: {wav_files[current_wav_index]}")
+
+def switch_wav_gif_file(direction):
+    """Switch between WAV and GIF files in WAV+GIF mode"""
+    global current_wav_index, current_gif_index
+    stop_audio()  # Stop current playback
+    
+    if direction == "next":
+        current_wav_index = (current_wav_index + 1) % len(wav_files)
+        current_gif_index = (current_gif_index + 1) % len(gif_files)
+    elif direction == "previous":
+        current_wav_index = (current_wav_index - 1) % len(wav_files)
+        current_gif_index = (current_gif_index - 1) % len(gif_files)
+    
+    print(f"WAV+GIF: {wav_files[current_wav_index]} + {gif_files[current_gif_index]}")
+
+def advance_wav_gif_pair():
+    """Advance to the next WAV+GIF pair, handling different list lengths"""
+    global current_wav_index, current_gif_index
+    
+    # Always advance GIF index
+    current_gif_index = (current_gif_index + 1) % len(gif_files)
+    
+    # Only advance WAV index if we have more WAV files
+    # This creates a "carousel" effect where GIFs cycle through all WAVs
+    if len(wav_files) > 1:
+        current_wav_index = (current_wav_index + 1) % len(wav_files)
+    # If we only have one WAV file, keep using it with all GIFs
 
 # Function to play A0.gif for the same duration as the original wait
 def show_interstitial():
@@ -514,21 +658,28 @@ def show_error(message):
     main_group.append(text_area)
     time.sleep(2)
 
-# Main loop
+# Initialize files
 gif_files = get_gif_files()
 current_gif_index = 0
 
-if not gif_files:
-    show_error("No GIFs in /gifs")
+# Main loop
+if not gif_files and not wav_files:
+    show_error("No GIFs or WAVs found")
     while True:
         time.sleep(1)
 else:
-    print(f"Found {len(gif_files)} GIFs")
+    if gif_files:
+        print(f"Found {len(gif_files)} GIFs")
+    if wav_files:
+        print(f"Found {len(wav_files)} WAVs")
 
     # Initial setup period for buttons
     print("Initializing buttons...")
     time.sleep(1)
 
+    # Counter to track consecutive WAV+GIF playbacks for memory management
+    playback_counter = 0
+    
     while True:
         try:
             if current_mode == "gif":
@@ -611,9 +762,60 @@ else:
                     if pressed and direction == "mode":
                         switch_mode()
                     time.sleep(0.1)
+            
+            elif current_mode == "wav_gif":
+                # WAV+GIF mode - play both simultaneously
+                if wav_files and gif_files:
+                    print(f"Starting WAV+GIF: {wav_files[current_wav_index]} + {gif_files[current_gif_index]}")
+                    
+                    # Play WAV with GIF using optimized non-blocking approach
+                    # This function will display the actual GIF in main_group
+                    result = play_wav_with_gif(wav_files[current_wav_index], gif_files[current_gif_index])
+                    
+                    # Handle result
+                    if result == "mode":
+                        switch_mode()
+                    elif result == "next":
+                        switch_wav_gif_file("next")
+                    elif result == "previous":
+                        switch_wav_gif_file("previous")
+                    elif result == "complete":
+                        # Use the new safe advancement function
+                        advance_wav_gif_pair()
+                    # For "error" or "stopped", don't advance but allow continuation
+                    
+                    # Increment playback counter and force GC every few playbacks
+                    playback_counter += 1
+                    if playback_counter >= 3:
+                        print("Forcing garbage collection...")
+                        gc.collect()
+                        playback_counter = 0
+                    
+                    # Small delay between playbacks to prevent rapid cycling
+                    time.sleep(0.5)
+                else:
+                    # Missing files - show error and allow mode switching
+                    while len(main_group) > 0:
+                        main_group.pop()
+                    error_text = label.Label(terminalio.FONT, text="Need WAV+GIF files", color=0xFFFFFF)
+                    error_text.x = 10
+                    error_text.y = HEIGHT // 2
+                    main_group.append(error_text)
+                    
+                    pressed, direction = button_pressed()
+                    if pressed:
+                        if direction == "mode":
+                            switch_mode()
+                        elif direction == "next" or direction == "previous":
+                            switch_wav_gif_file(direction)
+                    time.sleep(0.1)
 
         except Exception as e:
             print(f"Fatal error in main loop: {e}")
             show_error("Fatal error, resetting")
             current_gif_index = 0
+            current_wav_index = 0
+            playback_counter = 0
             stop_audio()  # Ensure audio is stopped on error
+            # Force a full garbage collection on error
+            gc.collect()
