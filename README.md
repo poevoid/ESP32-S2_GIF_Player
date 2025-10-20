@@ -43,7 +43,6 @@ Circuitpython 9.x on a lolin s2 mini
 
 To enable automatic time synchronization in clock mode, edit the `settings.toml` file in the root directory with a text editor and enter your wifi SSID and password accordingly:
 
-```toml
 CIRCUITPY_WIFI_SSID = "your_wifi_name"
 CIRCUITPY_WIFI_PASSWORD = "your_wifi_password"
 CIRCUITPY_TZ_OFFSET = "-5"  # Your timezone offset from UTC
