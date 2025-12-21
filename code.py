@@ -14,6 +14,10 @@ import socketpool
 import adafruit_ntp
 import rtc
 
+# New imports for CircuitPython 10
+import adafruit_connection_manager
+from fourwire import FourWire
+
 # Release any existing displays
 displayio.release_displays()
 
@@ -23,8 +27,8 @@ tft_cs = board.IO7   # Chip select (display)
 tft_dc = board.IO3   # Data/command (display)
 tft_reset = board.IO5  # Reset (display)
 
-# Initialize SPI bus at 1MHz
-display_bus = displayio.FourWire(
+# Initialize SPI bus at 1MHz with new FourWire import
+display_bus = FourWire(
     spi,
     command=tft_dc,
     chip_select=tft_cs,
@@ -77,7 +81,7 @@ last_button_press = 0
 # Mode state
 current_mode = "gif"  # Start in GIF mode
 
-# WiFi and time setup
+# WiFi and time setup - Updated for CircuitPython 10
 try:
     # Get WiFi details from settings.toml
     ssid = os.getenv("CIRCUITPY_WIFI_SSID")
@@ -89,8 +93,9 @@ try:
     
     if ssid and password:
         wifi.radio.connect(ssid, password)
-        pool = socketpool.SocketPool(wifi.radio)
-        ntp = adafruit_ntp.NTP(pool, tz_offset=tz_offset)
+        # Updated socket pool creation for CircuitPython 10
+        pool = adafruit_connection_manager.get_radio_socketpool(wifi.radio)
+        ntp = adafruit_ntp.NTP(pool, tz_offset=tz_offset, cache_seconds=3600)
         rtc.RTC().datetime = ntp.datetime
         print(f"Time synchronized via NTP (Timezone offset: {tz_offset} hours)")
     else:
@@ -172,6 +177,7 @@ def show_interstitial():
 
         # Play A0.gif for approximately 2 seconds (same as original wait)
         start_time = time.monotonic()
+        # Updated GIF playback method for CircuitPython 10
         next_delay = odg.next_frame()
         frame_start = start_time
 
@@ -267,8 +273,8 @@ def play_gif(gif_path):
             main_group.pop()
         main_group.append(face)
 
-        next_delay = odg.next_frame()
-        start_time = time.monotonic()
+        # Updated GIF playback method for CircuitPython 10
+        next_delay = odg.next_frame()  # Load first frame
 
         while True:
             pressed, direction = button_pressed()
@@ -276,12 +282,9 @@ def play_gif(gif_path):
                 print(f"Button pressed - {direction}")
                 return direction
 
-            elapsed = time.monotonic() - start_time
-            if elapsed >= next_delay:
-                start_time = time.monotonic()
-                next_delay = odg.next_frame()
-            else:
-                time.sleep(0.001)
+            # Updated: Sleep for frame delay then load next frame
+            time.sleep(max(0, next_delay))
+            next_delay = odg.next_frame()
 
         odg.deinit()
         gc.collect()
