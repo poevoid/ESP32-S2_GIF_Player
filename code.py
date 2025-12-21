@@ -15,8 +15,9 @@ import socketpool
 import adafruit_ntp
 import rtc
 import asyncio
-import analogio  # Added for analog reading
-import array  # Added for storing wave data
+import analogio
+import array
+from fourwire import FourWire
 
 # Release any existing displays
 displayio.release_displays()
@@ -46,6 +47,7 @@ def cleanup_macos_files(directory):
 cleanup_macos_files('/gifs')
 cleanup_macos_files('/wavs')
 
+# Initialize LEDs
 fled = digitalio.DigitalInOut(board.IO14)
 fled.direction = digitalio.Direction.OUTPUT
 
@@ -55,21 +57,20 @@ uvled.direction = digitalio.Direction.OUTPUT
 fled.value = False
 uvled.value = False
 
-# Initialize PWM once and keep it alive
+# Initialize PWM
 pwm = pwmio.PWMOut(board.IO18, frequency=40000, duty_cycle=0)
-DELAY_COUNT = 65  # Optimal delay for Lolin S2 Mini
 
 # Initialize analog input for microphone/IO12
 mic = analogio.AnalogIn(board.IO12)
 
-# Configure SPI with explicit pins for ESP32-S2 Mini
+# Configure SPI
 spi = busio.SPI(clock=board.IO7, MOSI=board.IO11)
-tft_cs = board.IO13   # Chip select (display)
-tft_dc = board.IO5   # Data/command (display)
-tft_reset = board.IO3  # Reset (display)
+tft_cs = board.IO13   # Chip select
+tft_dc = board.IO5   # Data/command
+tft_reset = board.IO3  # Reset
 
 # Initialize SPI bus at 1MHz
-display_bus = displayio.FourWire(
+display_bus = FourWire(
     spi,
     command=tft_dc,
     chip_select=tft_cs,
@@ -77,8 +78,8 @@ display_bus = displayio.FourWire(
     baudrate=1000000
 )
 
-# Initialize SH1106 display with 130 width to account for the buffer
-WIDTH = 130  # Use 130 instead of 128 to include the full buffer
+# Initialize SH1106 display
+WIDTH = 130
 HEIGHT = 64
 display = adafruit_displayio_sh1106.SH1106(
     display_bus,
@@ -87,7 +88,7 @@ display = adafruit_displayio_sh1106.SH1106(
 )
 display.rotation = 90
 
-# Create a main group that applies the 2-pixel offset to ALL content
+# Create main group
 main_group = displayio.Group(x=2, y=0)
 display.root_group = main_group
 
@@ -103,7 +104,6 @@ class PhysicalButton:
     def pressed(self):
         current_state = self.button.value
         # Detect falling edge (button press) for pull-up configuration
-        # For pull-up: pressed = False (LOW), not pressed = True (HIGH)
         pressed = (self.last_state is True) and (current_state is False)
         self.last_state = current_state
         return pressed
@@ -112,15 +112,15 @@ class PhysicalButton:
 try:
     next_button = PhysicalButton(board.IO8)
     prev_button = PhysicalButton(board.IO6)
-    mode_button = PhysicalButton(board.IO2)  # New mode button
+    mode_button = PhysicalButton(board.IO2)
 except Exception as e:
     print(f"Button init error: {e}")
 
-# Button press cooldown to prevent spam (in seconds)
+# Button press cooldown (in seconds)
 BUTTON_COOLDOWN = 0.5
 last_button_press = 0
 
-# Mode state - Removed "wav" and "wav_gif", added "mic"
+# Mode state
 current_mode = "gif"  # Start in GIF mode
 
 # LED Control Mode State
@@ -134,25 +134,23 @@ flash_state = 0
 last_flash_time = 0
 FLASH_INTERVAL = 0.5  # seconds between flash changes
 
-# Wave display parameters for Mic mode (rotated 90 degrees)
-# Since display is rotated 90 degrees, we need to adjust dimensions
-WAVE_WIDTH = 64  # Display height becomes width after rotation
-WAVE_HEIGHT = 128  # Display width becomes height after rotation
-WAVE_BUFFER_SIZE = 64  # Number of samples to display horizontally
-wave_buffer = array.array('H', [0] * WAVE_BUFFER_SIZE)  # Store samples as unsigned shorts
-wave_index = 0  # Current position in buffer
+# Wave display parameters for Mic mode
+WAVE_WIDTH = 64
+WAVE_HEIGHT = 128
+WAVE_BUFFER_SIZE = 64
+wave_buffer = array.array('H', [0] * WAVE_BUFFER_SIZE)
+wave_index = 0
 
 # Calibration parameters for wave display
-AMP_VAL = 1600  # Amplification value (adjust for sensitivity)
-Y_OFFSET = 944  # DC offset to center wave (adjust based on your signal)
-# For ESP32-S2, analog values range 0-65535 (16-bit)
+AMP_VAL = 1600
+Y_OFFSET = 944
 
 # WiFi and time setup
 try:
     # Get WiFi details from settings.toml
     ssid = os.getenv("CIRCUITPY_WIFI_SSID")
     password = os.getenv("CIRCUITPY_WIFI_PASSWORD")
-    tz_offset_str = os.getenv("CIRCUITPY_TZ_OFFSET", "0")  # Default to 0 if not set
+    tz_offset_str = os.getenv("CIRCUITPY_TZ_OFFSET", "0")
     
     # Convert timezone offset to integer
     tz_offset = int(tz_offset_str)
@@ -169,77 +167,29 @@ except Exception as e:
     print(f"Failed to sync time: {e}")
 
 def turn_off_all_leds():
-    """Turn off both LEDs - used when switching to non-LED modes"""
+    """Turn off both LEDs"""
     fled.value = False
     uvled.value = False
 
 def stop_audio():
-    """Stop audio playback by setting duty cycle to 0"""
+    """Stop audio playback"""
     pwm.duty_cycle = 0
 
-async def play_gif_looping(gif_path, stop_event):
-    """Play GIF with looping - continues until stop_event is set"""
-    odg = None
-    try:
-        odg = gifio.OnDiskGif(gif_path)
-        face = displayio.TileGrid(
-            odg.bitmap,
-            pixel_shader=displayio.ColorConverter(
-                input_colorspace=displayio.Colorspace.L8
-            ),
-            x=(64 - odg.bitmap.width) // 2 if odg.bitmap.width < 64 else 0,
-            y=(128 - odg.bitmap.height) // 2 if odg.bitmap.height < 128 else 0
-        )
-
-        # Clear and set up display
-        while len(main_group) > 0:
-            main_group.pop()
-        main_group.append(face)
-
-        next_delay = odg.next_frame()
-        last_frame_time = time.monotonic()
-
-        while not stop_event.is_set():
-            current_time = time.monotonic()
-            
-            # Check if it's time for next frame
-            if current_time - last_frame_time >= next_delay:
-                last_frame_time = current_time
-                try:
-                    next_delay = odg.next_frame()
-                except EOFError:
-                    # GIF ended - restart
-                    odg.deinit()
-                    odg = gifio.OnDiskGif(gif_path)
-                    next_delay = odg.next_frame()
-            
-            # Yield with the optimized timing you found
-            await asyncio.sleep(0.09)  # Your optimized balance
-
-        if odg:
-            odg.deinit()
-        gc.collect()
-
-    except Exception as e:
-        print(f"Error playing {gif_path}: {e}")
-        if odg:
-            odg.deinit()
-
-# Create clock display elements once (not every second)
+# Create clock display elements
 time_label = label.Label(terminalio.FONT, text="00:00:00", color=0xFFFFFF)
 time_label.x = 10
-time_label.y = HEIGHT // 2 - 10
+time_label.y = WIDTH // 2 - 10
 
 date_label = label.Label(terminalio.FONT, text="YYYY-MM-DD", color=0xFFFFFF)
-date_label.x = 10
-date_label.y = HEIGHT // 2 + 10
+date_label.x = 5
+date_label.y = WIDTH // 2 + 10
 
 clock_group = displayio.Group()
 clock_group.append(time_label)
 clock_group.append(date_label)
 
 # Create LED control display elements
-led_title = label.Label(terminalio.FONT, text="LED CONTROL", color=0xFFFFFF)
+led_title = label.Label(terminalio.FONT, text="LED GUI", color=0xFFFFFF)
 led_title.x = 10
 led_title.y = 10
 
@@ -257,18 +207,18 @@ led_control_group.append(fled_label)
 led_control_group.append(uvled_label)
 
 # Create bitmap for wave display
-wave_bitmap = displayio.Bitmap(WAVE_WIDTH, WAVE_HEIGHT, 2)  # 2 colors
+wave_bitmap = displayio.Bitmap(WAVE_WIDTH, WAVE_HEIGHT, 2)
 wave_palette = displayio.Palette(2)
 wave_palette[0] = 0x000000  # Black background
 wave_palette[1] = 0xFFFFFF  # White wave
 wave_tilegrid = displayio.TileGrid(wave_bitmap, pixel_shader=wave_palette)
 
-# Create Mic mode group with just the wave display
+# Create Mic mode group
 mic_group = displayio.Group()
 mic_group.append(wave_tilegrid)
 
 def update_clock_display():
-    """Update the clock display with current time (no flicker)"""
+    """Update the clock display with current time"""
     try:
         now = time.localtime()
         
@@ -294,22 +244,15 @@ def clear_wave_display():
             wave_bitmap[x, y] = 0
 
 def update_wave_display():
-    """Update the wave display with new samples - similar to your Arduino code"""
+    """Update the wave display with new samples"""
     global wave_index
     
-    # Read analog value from IO12
+    # Read analog value
     sample = mic.value
     
-    # Apply your formula: ((sample * ampVal) / 64) - yoffset
-    # Adjusted for 16-bit ADC (0-65535) and display rotation
-    # Note: display is rotated 90 degrees, so we're drawing vertical lines
+    # Apply formula and map to display height
     new_y = int(((sample * AMP_VAL) // 64) - (Y_OFFSET // 512))
-    
-    # Map to display height (128 pixels tall after rotation)
-    # Center around middle (64) with some scaling
-    new_y = (new_y // 512) + 64  # Adjust these values for your signal
-    
-    # Clamp to display bounds
+    new_y = (new_y // 512) + 64
     new_y = max(0, min(WAVE_HEIGHT - 1, new_y))
     
     # Store in buffer
@@ -324,52 +267,37 @@ def update_wave_display():
     
     # Connect to previous sample with a line
     if wave_index > 0:
-        prev_y = wave_buffer[wave_index - 1]
-        last_y = wave_buffer[wave_index]
+        prev_x = wave_index - 1
+        prev_y_val = wave_buffer[prev_x]
         
-        # Draw vertical line between previous and current point
-        # Since we're drawing vertical lines column by column, we connect points
-        # in the same column (vertical lines between samples in adjacent columns)
-        # Actually, we need to think differently for rotated display...
-        
-        # For rotated display (90 degrees), we're drawing column by column
-        # Each column gets a single point at new_y
-        # To create a continuous wave, we need to draw lines between columns
-        if wave_index > 0:
-            prev_x = wave_index - 1
-            prev_y_val = wave_buffer[prev_x]
+        # Simple line drawing
+        if abs(new_y - prev_y_val) > 1:
+            x0, y0 = prev_x, prev_y_val
+            x1, y1 = wave_index, new_y
             
-            # Draw line between (prev_x, prev_y) and (wave_index, new_y)
-            # Simple line drawing algorithm
-            if abs(new_y - prev_y_val) > 1:
-                x0, y0 = prev_x, prev_y_val
-                x1, y1 = wave_index, new_y
-                
-                # Bresenham line algorithm for better line drawing
-                dx = abs(x1 - x0)
-                dy = abs(y1 - y0)
-                sx = 1 if x0 < x1 else -1
-                sy = 1 if y0 < y1 else -1
-                err = dx - dy
-                
-                while True:
-                    wave_bitmap[x0, y0] = 1
-                    if x0 == x1 and y0 == y1:
-                        break
-                    e2 = 2 * err
-                    if e2 > -dy:
-                        err -= dy
-                        x0 += sx
-                    if e2 < dx:
-                        err += dx
-                        y0 += sy
+            dx = abs(x1 - x0)
+            dy = abs(y1 - y0)
+            sx = 1 if x0 < x1 else -1
+            sy = 1 if y0 < y1 else -1
+            err = dx - dy
+            
+            while True:
+                wave_bitmap[x0, y0] = 1
+                if x0 == x1 and y0 == y1:
+                    break
+                e2 = 2 * err
+                if e2 > -dy:
+                    err -= dy
+                    x0 += sx
+                if e2 < dx:
+                    err += dx
+                    y0 += sy
     
     # Update index for next sample
     wave_index = (wave_index + 1) % WAVE_WIDTH
     
-    # If we wrapped around, clear the next position we're about to write to
+    # If we wrapped around, clear the next position
     if wave_index == 0:
-        # Clear the first column for the next cycle
         for y in range(WAVE_HEIGHT):
             wave_bitmap[0, y] = 0
 
@@ -395,7 +323,6 @@ def switch_mode():
         display.root_group = mic_group
         turn_off_all_leds()
         stop_audio()
-        # Clear and initialize wave display
         clear_wave_display()
         wave_index = 0
         print("Switched to Mic mode")
@@ -437,22 +364,19 @@ def update_led_display():
     elif led_control_state == 4:  # Flashing mode
         fled_label.text = "LED1: FLASHING"
         uvled_label.text = "LED2: FLASHING"
-        # Flash state will be handled in the main loop
         last_flash_time = time.monotonic()
 
 def handle_flashing():
-    """Handle the flashing mode - called repeatedly in main loop"""
+    """Handle the flashing mode"""
     global flash_state, last_flash_time
     
     current_time = time.monotonic()
     if current_time - last_flash_time >= FLASH_INTERVAL:
         if flash_state == 0:
-            # LED1 on, LED2 off
             fled.value = True
             uvled.value = False
             flash_state = 1
         else:
-            # LED2 on, LED1 off
             fled.value = False
             uvled.value = True
             flash_state = 0
@@ -526,7 +450,7 @@ def get_gif_files():
     return sorted(files)
 
 async def play_gif_async_standalone(gif_path):
-    """Play GIF with seamless looping using asyncio"""
+    """Play GIF with seamless looping"""
     stop_event = asyncio.Event()
     
     try:
@@ -535,7 +459,7 @@ async def play_gif_async_standalone(gif_path):
         face = displayio.TileGrid(
             odg.bitmap,
             pixel_shader=displayio.ColorConverter(
-                input_colorspace=displayio.Colorspace.L8
+                input_colorspace=displayio.Colorspace.RGB565_SWAPPED
             ),
             x=(64 - odg.bitmap.width) // 2 if odg.bitmap.width < 64 else 0,
             y=(128 - odg.bitmap.height) // 2 if odg.bitmap.height < 128 else 0
@@ -560,7 +484,7 @@ async def play_gif_async_standalone(gif_path):
                 try:
                     next_delay = odg.next_frame()
                 except EOFError:
-                    # GIF ended - restart it for seamless looping
+                    # GIF ended - restart it
                     odg.deinit()
                     odg = gifio.OnDiskGif(gif_path)
                     next_delay = odg.next_frame()
@@ -586,11 +510,11 @@ def show_error(message):
     main_group.append(text_area)
     time.sleep(2)
 
-# Initialize files - only GIFs needed now
+# Initialize files
 gif_files = get_gif_files()
 current_gif_index = 0
 
-# Calibration helper - you might need to adjust these values
+# Calibration helper
 def calibrate_mic():
     """Take a few readings to help calibrate the Y_OFFSET"""
     print("Calibrating microphone...")
@@ -605,7 +529,7 @@ def calibrate_mic():
     return avg
 
 # Optional: Uncomment to run calibration when starting
-calibrate_mic()
+# calibrate_mic()
 
 # Main async loop
 async def main_async_loop():
@@ -662,19 +586,14 @@ async def main_async_loop():
                 await asyncio.sleep(0.1)
             
             elif current_mode == "mic":
-                # Update wave display with new sample
                 update_wave_display()
                 
-                # Check for button presses
                 pressed, direction = button_pressed()
                 if pressed:
                     if direction == "mode":
                         switch_mode()
-                    # Note: next/prev buttons don't do anything in Mic mode
-                    # since there's nothing to switch between
                 
-                # Faster sampling for wave display
-                await asyncio.sleep(0.005)  # 5ms delay for ~200Hz sampling
+                await asyncio.sleep(0.005)
 
         except Exception as e:
             print(f"Fatal error in main loop: {e}")
